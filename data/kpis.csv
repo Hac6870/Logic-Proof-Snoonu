@@ -1,0 +1,2 @@
+baseline,speed_kmh_used,circuity_factor,overhead_med_min,avg_eta_min,p50_eta_min,p90_eta_min,p95_eta_min,max_eta_min,avg_deadhead_km,avg_total_km,deadhead_share,couriers_used,avg_wait_min,avg_delta_vs_given_est_min
+B0.1_nearest_available_solo_haversine_circuity,27.62854950115119,1.2,17.398161084916172,22.66357662339594,21.579415771887735,25.192117348762952,31.37463211036848,36.88388310947701,1.1631438202276456,2.1808637755087203,0.5333408868952965,47,0.5293063726666667,2.723576623395942

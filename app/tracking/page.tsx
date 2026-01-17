@@ -1,11 +1,12 @@
 "use client";
 
-import { Suspense, useEffect, useState, useMemo } from 'react';
+import { Suspense, useEffect, useState, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { ArrowLeft, Phone, MessageSquare, MapPin, Navigation, ShoppingBag } from 'lucide-react';
 import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import { cn } from '@/lib/utils';
+import { DispatchPlan } from '@/lib/pulseDispatch';
 
 // Dynamic import for Map to avoid SSR issues
 const MapComponent = dynamic(() => import('@/components/MapInner'), {
@@ -25,16 +26,50 @@ export default function TrackingPage() {
 
 function TrackingContent() {
     const searchParams = useSearchParams();
-    const mode = (searchParams.get('mode') as Mode) || 'normal';
+    const mode = (searchParams.get('mode') as any) || 'NORMAL';
+    const normalizedMode = mode.toLowerCase() as Mode;
+    const tier = mode.toUpperCase(); // FAST, NORMAL, ECO
 
-    const [eta, setEta] = useState(mode === 'fast' ? 35 : mode === 'normal' ? 45 : 60);
+    const [plan, setPlan] = useState<DispatchPlan | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [eta, setEta] = useState(normalizedMode === 'fast' ? 35 : normalizedMode === 'normal' ? 45 : 60);
     const [status, setStatus] = useState('Confirmed');
     const [showAddOn, setShowAddOn] = useState(true);
-    const [total, setTotal] = useState(34 + (mode === 'fast' ? 10 : mode === 'normal' ? 5 : 0));
+    const [total, setTotal] = useState(34);
     const [toast, setToast] = useState<string | null>(null);
 
     // Simulation Timer
     const [elapsed, setElapsed] = useState(0);
+
+    // Fetch Plan on Mount
+    useEffect(() => {
+        async function fetchDispatch() {
+            try {
+                // Use coordinates that trigger bundling (Al Sadd -> West Bay)
+                const res = await fetch('/api/dispatch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        tier: tier,
+                        pickup: { lat: 25.2859, lon: 51.4965 },
+                        drop: { lat: 25.3295, lon: 51.5298 }
+                    })
+                });
+                const data = await res.json();
+                if (data && !data.error) {
+                    setPlan(data);
+                    setEta(data.eta_minutes);
+                    setTotal(34 + (data.fee_qr || 0));
+                    console.log("Dispatch Plan:", data);
+                }
+            } catch (err) {
+                console.error("Failed to fetch dispatch plan:", err);
+            } finally {
+                setLoading(false);
+            }
+        }
+        fetchDispatch();
+    }, [tier]);
 
     useEffect(() => {
         const timer = setInterval(() => {
@@ -45,7 +80,7 @@ function TrackingContent() {
 
     useEffect(() => {
         // Hide add-on strip logic
-        const limit = mode === 'fast' ? 90 : mode === 'normal' ? 120 : 240;
+        const limit = normalizedMode === 'fast' ? 90 : normalizedMode === 'normal' ? 120 : 240;
         if (elapsed > limit) setShowAddOn(false);
 
         // Update Status
@@ -54,7 +89,7 @@ function TrackingContent() {
         else if (elapsed < 15) setStatus('Picked up');
         else if (elapsed < 60) setStatus('On the way');
         else setStatus('Delivered');
-    }, [elapsed, mode]);
+    }, [elapsed, normalizedMode]);
 
     const handleAddProduct = (item: string, price: number, timeAdded: number) => {
         setTotal(t => t + price);
@@ -64,9 +99,11 @@ function TrackingContent() {
     };
 
     const getDecisionLabel = () => {
-        if (mode === 'fast') return "Pulse decision: SOLO (Fast)";
-        if (mode === 'normal') return "Pulse decision: SOLO/BUNDLE (Normal)";
-        return "Pulse decision: HUB RELAY (Eco)";
+        if (!plan) return "Dispatching...";
+        if (plan.decision === 'SOLO') return `Pulse: SOLO (${plan.tier})`;
+        if (plan.decision === 'BUNDLE') return `Pulse: BUNDLE (${plan.tier})`;
+        if (plan.decision === 'HUB') return `Pulse: HUB RELAY (${plan.tier})`;
+        return "Pulse: Dispatching...";
     };
 
     return (
@@ -78,24 +115,33 @@ function TrackingContent() {
                 </Link>
                 <div className="bg-white/90 backdrop-blur px-4 py-2 rounded-full shadow-md text-center pointer-events-auto">
                     <div className="text-[10px] uppercase font-bold text-gray-500 tracking-wider">Deliver Now</div>
-                    <div className="text-xl font-extrabold text-[#111]">{eta} min</div>
+                    <div className="text-xl font-extrabold text-[#111]">
+                        {loading ? "..." : `${eta} min`}
+                    </div>
                 </div>
                 <div className="w-10"></div>{/* Spacer */}
             </div>
 
             {/* Pulse Decision Chip */}
-            <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-20">
+            <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-20 w-max max-w-[90%]">
                 <div className={cn(
-                    "px-3 py-1 rounded-full text-[10px] font-bold text-white shadow-sm border border-white/20",
-                    mode === 'fast' ? "bg-amber-500" : mode === 'normal' ? "bg-blue-500" : "bg-green-600"
+                    "px-3 py-1 rounded-full text-[10px] font-bold text-white shadow-sm border border-white/20 flex flex-col items-center",
+                    normalizedMode === 'fast' ? "bg-amber-500" : normalizedMode === 'normal' ? "bg-blue-500" : "bg-green-600"
                 )}>
-                    {getDecisionLabel()}
+                    <span>{getDecisionLabel()}</span>
+                    {plan?.explanation && plan.explanation.length > 0 && (
+                        <span className="text-[8px] font-normal opacity-90 mt-0.5 max-w-[200px] truncate">
+                            {plan.decision === 'BUNDLE'
+                                ? `Bundled w/ ${plan.bundled_order_ids.join(', ')}`
+                                : plan.explanation[0]}
+                        </span>
+                    )}
                 </div>
             </div>
 
             {/* Map Area */}
             <div className="flex-1 relative z-0">
-                <MapComponent mode={mode} />
+                <MapComponent mode={normalizedMode} />
             </div>
 
             {/* Bottom Sheet */}
@@ -124,7 +170,9 @@ function TrackingContent() {
                             <Navigation size={20} className="text-[#111]" />
                         </div>
                         <div>
-                            <h3 className="font-bold text-[#111] text-sm">Rider • Doha</h3>
+                            <h3 className="font-bold text-[#111] text-sm">
+                                {plan ? `Rider ${plan.courier_id.split('-').pop()}` : "Assigning..."}
+                            </h3>
                             <p className="text-xs text-snoonu-red font-medium">Pulse Courier</p>
                         </div>
                     </div>
@@ -140,7 +188,7 @@ function TrackingContent() {
                         <div className="flex justify-between items-center mb-2">
                             <h3 className="font-bold text-[#111] text-sm">Something else?</h3>
                             <span className="text-[10px] font-bold text-red-500 bg-red-50 px-2 py-0.5 rounded">
-                                {mode === 'fast' ? 'Ending soon' : 'Add-on available'}
+                                {normalizedMode === 'fast' ? 'Ending soon' : 'Add-on available'}
                             </span>
                         </div>
                         <div className="flex items-center gap-3 overflow-x-auto no-scrollbar py-1">
@@ -152,7 +200,7 @@ function TrackingContent() {
                                     <div className="text-[10px] text-gray-500">34 QAR</div>
                                 </div>
                                 <button
-                                    onClick={() => handleAddProduct('Cupcakes', 34, mode === 'fast' ? 2 : mode === 'normal' ? 3 : 4)}
+                                    onClick={() => handleAddProduct('Cupcakes', 34, normalizedMode === 'fast' ? 2 : normalizedMode === 'normal' ? 3 : 4)}
                                     className="bg-gray-100 hover:bg-gray-200 w-8 h-8 rounded-full flex items-center justify-center text-[#111]"
                                 >
                                     <ShoppingBag size={14} />
@@ -160,7 +208,7 @@ function TrackingContent() {
                             </div>
 
                             {/* Card 2: Stickers */}
-                            <div className={cn("min-w-[200px] bg-white border border-gray-100 rounded-card p-2 flex items-center gap-2 shadow-sm", mode === 'fast' ? "opacity-50 grayscale" : "")}>
+                            <div className={cn("min-w-[200px] bg-white border border-gray-100 rounded-card p-2 flex items-center gap-2 shadow-sm", normalizedMode === 'fast' ? "opacity-50 grayscale" : "")}>
                                 <img src="/assets/gumart-stickers.png" className="w-10 h-10 rounded-lg bg-gray-50 object-cover" />
                                 <div className="flex-1">
                                     <div className="text-xs font-bold text-[#111] line-clamp-1">GUmart stickers</div>
@@ -168,17 +216,17 @@ function TrackingContent() {
                                 </div>
                                 <button
                                     onClick={() => {
-                                        if (mode === 'fast') return;
-                                        handleAddProduct('Stickers', 20, mode === 'normal' ? 3 : 4);
+                                        if (normalizedMode === 'fast') return;
+                                        handleAddProduct('Stickers', 20, normalizedMode === 'normal' ? 3 : 4);
                                     }}
-                                    disabled={mode === 'fast'}
+                                    disabled={normalizedMode === 'fast'}
                                     className="bg-gray-100 hover:bg-gray-200 w-8 h-8 rounded-full flex items-center justify-center text-[#111] disabled:cursor-not-allowed"
                                 >
                                     <ShoppingBag size={14} />
                                 </button>
                             </div>
                         </div>
-                        {mode === 'fast' && <p className="text-[10px] text-gray-400 mt-1">Fast: In-route add-ons from other merchants disabled.</p>}
+                        {normalizedMode === 'fast' && <p className="text-[10px] text-gray-400 mt-1">Fast: In-route add-ons from other merchants disabled.</p>}
                     </div>
                 )}
             </div>
