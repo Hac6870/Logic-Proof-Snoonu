@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pulse Dispatch Demo</title>
+    <style>
+        body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+        .log-entry { margin-bottom: 5px; white-space: pre-wrap; }
+        .header { color: #569cd6; font-weight: bold; margin-top: 20px; border-bottom: 1px solid #444; padding-bottom: 5px; }
+        .key { color: #9cdcfe; }
+        .string { color: #ce9178; }
+        .number { color: #b5cea8; }
+    </style>
+</head>
+<body>
+    <h1>Pulse Dispatch Demo Output</h1>
+    <div id="output">Running...</div>
+
+    <script>
+        // --- DATA ---
+        // Minimal subsets of data for the demo to work without valid CSV loading in browser
+        const RAW_COURIERS = [
+            { courier_id: "C001", lat: 25.285, lon: 51.529, status: "available", capacity: 3, current_orders: 0 }, // Near Msheireb
+            { courier_id: "C002", lat: 25.319, lon: 51.519, status: "available", capacity: 3, current_orders: 1 }, // Near West Bay
+            { courier_id: "C003", lat: 25.315, lon: 51.441, status: "available", capacity: 3, current_orders: 0 }, // Near Education City
+            { courier_id: "C004", lat: 25.280, lon: 51.520, status: "busy", capacity: 2, current_orders: 2 },
+            { courier_id: "C005", lat: 25.300, lon: 51.500, status: "available", capacity: 3, current_orders: 0 },
+            { courier_id: "C006", lat: 25.290, lon: 51.510, status: "offline", capacity: 3, current_orders: 0 },
+        ];
+
+        const RAW_ORDERS = [
+            { order_id: "ORD_A", pickup_lat: 25.286, pickup_lon: 51.528, drop_lat: 25.290, drop_lon: 51.530, assigned: false }, // Nearby Msheireb
+            { order_id: "ORD_B", pickup_lat: 25.321, pickup_lon: 51.521, drop_lat: 25.325, drop_lon: 51.525, assigned: false }, // Nearby West Bay
+            { order_id: "ORD_C", pickup_lat: 25.400, pickup_lon: 51.600, drop_lat: 25.410, drop_lon: 51.610, assigned: true },
+        ];
+
+        // --- CONSTANTS ---
+        const SLA = { FAST: 35, NORMAL: 45, ECO: 60 };
+        const FEE = { FAST: 10, NORMAL: 5, ECO: 0 };
+        const HUBS = [
+            { id: "EDUCATION_CITY", name: "Education City", lat: 25.314, lon: 51.44 },
+            { id: "WEST_BAY", name: "West Bay", lat: 25.32, lon: 51.52 },
+            { id: "MSHEIREB", name: "Msheireb", lat: 25.286, lon: 51.528 },
+        ];
+        const SPEED_KMH = 28;
+        const CIRCUITY = 1.25;
+        const STOP_PENALTY = 2; 
+        const HUB_PENALTY = 5; 
+        const ECO_HOLD = 2;
+
+        // --- HELPERS ---
+        function haversine(a, b) {
+            const R = 6371; 
+            const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+            const dLon = ((b.lon - a.lon) * Math.PI) / 180;
+            const x = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                    Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) *
+                    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+        }
+
+        function travelMin(distKm) {
+            return (distKm * CIRCUITY / SPEED_KMH) * 60;
+        }
+
+        function lateRisk(eta, promised) {
+            const slack = promised - eta;
+            return slack >= 0 ? 0.1 : Math.min(1, Math.abs(slack) / 15);
+        }
+
+        // --- DISPATCH LOGIC ---
+        function pulseDispatch({ tier, new_order, all_orders, couriers }) {
+            const slaTarget = SLA[tier];
+            const promised = new_order.promised_eta_min ?? slaTarget;
+
+            // Shortlist
+            let valid = couriers.filter(c => c.status !== "offline" && c.current_orders + 1 <= c.capacity);
+            valid.sort((a,b) => haversine(a, {lat: new_order.pickup_lat, lon: new_order.pickup_lon}) - haversine(b, {lat: new_order.pickup_lat, lon: new_order.pickup_lon}));
+            let shortlist = valid.slice(0, 10);
+
+            if (shortlist.length === 0) {
+                 return { tier, decision: "SOLO", courier_id: "NONE", eta_minutes: slaTarget + 10, fee_qr: FEE[tier], explanation: ["Fallback"], route_steps: [], metrics: {} };
+            }
+
+            const candidates = [];
+            const bestCourier = shortlist[0];
+
+            // SOLO
+            {
+                const leg1 = haversine(bestCourier, { lat: new_order.pickup_lat, lon: new_order.pickup_lon });
+                const leg2 = haversine({ lat: new_order.pickup_lat, lon: new_order.pickup_lon }, { lat: new_order.drop_lat, lon: new_order.drop_lon });
+                const totalKm = (leg1 + leg2) * CIRCUITY;
+                const eta = travelMin(totalKm);
+                const risk = lateRisk(eta, promised);
+                candidates.push({
+                    score: eta + 4 * risk,
+                    plan: {
+                        tier, decision: "SOLO", courier_id: bestCourier.courier_id,
+                        bundled_order_ids: [], eta_minutes: Math.round(eta), fee_qr: FEE[tier],
+                        explanation: ["Direct solo delivery."],
+                        route_steps: ["Courier -> HoyaCafe", "Pickup -> House"],
+                        metrics: { detour_minutes: 0, late_risk_score: risk, total_distance_km: totalKm }
+                    }
+                });
+            }
+
+            // BUNDLE
+            if (tier === "NORMAL" || tier === "ECO") {
+                const radius = tier === "NORMAL" ? 2.0 : 3.0;
+                const partners = all_orders.filter(o => 
+                    !o.assigned && o.order_id !== new_order.order_id &&
+                    haversine({lat: new_order.pickup_lat, lon: new_order.pickup_lon}, {lat: o.pickup_lat, lon: o.pickup_lon}) <= radius
+                );
+                 partners.sort((a,b) => haversine({lat: new_order.pickup_lat, lon: new_order.pickup_lon}, {lat: a.pickup_lat, lon: a.pickup_lon}) - haversine({lat: new_order.pickup_lat, lon: new_order.pickup_lon}, {lat: b.pickup_lat, lon: b.pickup_lon}));
+
+                if (partners.length > 0) {
+                    const partner = partners[0];
+                    const p1 = { lat: new_order.pickup_lat, lon: new_order.pickup_lon };
+                    const p2 = { lat: partner.pickup_lat, lon: partner.pickup_lon };
+                    const d1 = { lat: new_order.drop_lat, lon: new_order.drop_lon };
+                    
+                    const leg1 = haversine(bestCourier, p1);
+                    const leg2 = haversine(p1, p2);
+                    const leg3 = haversine(p2, d1);
+                    const leg4 = haversine(d1, { lat: partner.drop_lat, lon: partner.drop_lon });
+                    
+                    const totalKm = (leg1 + leg2 + leg3 + leg4) * CIRCUITY;
+                    const eta = travelMin(totalKm) + (tier === "ECO" ? ECO_HOLD : 0);
+                    const soloEta = candidates[0].plan.eta_minutes;
+                    const detour = Math.max(0, eta - soloEta);
+                    const risk = lateRisk(eta, promised);
+                    const score = eta + 4*risk + detour + STOP_PENALTY;
+                    
+                    const validNormal = tier === "NORMAL" && detour <= 0.15 * soloEta && risk <= 0.35;
+                    const validEco = tier === "ECO" && detour <= 0.25 * soloEta && risk <= 0.55;
+
+                    if (validNormal || validEco) {
+                        candidates.push({
+                            score,
+                            plan: {
+                                tier, decision: "BUNDLE", courier_id: bestCourier.courier_id,
+                                bundled_order_ids: [partner.order_id], eta_minutes: Math.round(eta), fee_qr: FEE[tier],
+                                explanation: tier === "NORMAL" ? ["Normal Bundle"] : ["Eco Bundle"],
+                                route_steps: ["Courier -> HoyaCafe", "Pickup Partner", "Drop Both"],
+                                metrics: { detour_minutes: detour, late_risk_score: risk, total_distance_km: totalKm }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // HUB
+            if (tier === "ECO") {
+                let bestHub = null;
+                let minD = Infinity;
+                const p = { lat: new_order.pickup_lat, lon: new_order.pickup_lon };
+                const d = { lat: new_order.drop_lat, lon: new_order.drop_lon };
+                for (const h of HUBS) {
+                    const dist = haversine(p,h) + haversine(h,d);
+                    if(dist<minD) { minD=dist; bestHub=h; }
+                }
+                
+                if (bestHub) {
+                    const leg1 = haversine(bestCourier, p);
+                    const leg2 = haversine(p, bestHub);
+                    const leg3 = haversine(bestHub, d);
+                    const totalKm = (leg1+leg2+leg3)*CIRCUITY;
+                    const eta = travelMin(totalKm) + HUB_PENALTY;
+                    const soloEta = candidates[0].plan.eta_minutes;
+                    const detour = Math.max(0, eta - soloEta);
+                    const risk = lateRisk(eta, promised);
+                    const score = eta + 4*risk + detour + HUB_PENALTY;
+                    
+                    if (score <= candidates[0].score - 1.0 || eta <= soloEta - 2.0) {
+                        candidates.push({
+                            score,
+                            plan: {
+                                tier, decision: "HUB", courier_id: bestCourier.courier_id, hub_id: bestHub.id,
+                                bundled_order_ids: [], eta_minutes: Math.round(eta), fee_qr: FEE["ECO"],
+                                explanation: ["Hub Relay"],
+                                route_steps: ["Courier -> HoyaCafe", `Hub: ${bestHub.name}`, "Hub -> House"],
+                                metrics: { detour_minutes: detour, late_risk_score: risk, total_distance_km: totalKm }
+                            }
+                        });
+                    }
+                }
+            }
+
+            candidates.sort((a,b) => a.score - b.score);
+            return candidates[0].plan;
+        }
+
+        // --- RUNNER ---
+        function runDemo() {
+            const out = document.getElementById("output");
+            out.innerHTML = "";
+            const log = (msg) => {
+                const div = document.createElement("div");
+                div.className = "log-entry";
+                div.textContent = msg;
+                out.appendChild(div);
+            };
+
+            const logSection = (header) => {
+                const div = document.createElement("div");
+                div.className = "header";
+                div.textContent = header;
+                out.appendChild(div);
+            };
+
+            const newOrder = {
+                order_id: "NEW_DEMO",
+                pickup_lat: 25.2865, pickup_lon: 51.5285, // Msheireb
+                drop_lat: 25.3220, drop_lon: 51.5230, // West Bay
+                created_ts: Date.now(), assigned: false
+            };
+
+            log(`New Order: HoyaCafe -> House`);
+            log(`Loading ${RAW_ORDERS.length} orders and ${RAW_COURIERS.length} couriers...`);
+
+            ["FAST", "NORMAL", "ECO"].forEach(tier => {
+                logSection(`Running Dispatch: ${tier}`);
+                const plan = pulseDispatch({
+                    tier, 
+                    new_order: newOrder, 
+                    all_orders: RAW_ORDERS, 
+                    couriers: RAW_COURIERS
+                });
+                
+                log(`Decision: ${plan.decision}`);
+                log(`Courier:  ${plan.courier_id}`);
+                log(`ETA:      ${plan.eta_minutes} min`);
+                log(`Fee:      ${plan.fee_qr} QAR`);
+                if(plan.decision === "BUNDLE") log(`Bundle:   ${plan.bundled_order_ids.join(",")}`);
+                if(plan.decision === "HUB") log(`Hub:      ${plan.plan?.hub_id || plan.hub_id}`);
+                log(`Route:    ${plan.route_steps.join(" -> ")}`);
+            });
+        }
+
+        runDemo();
+    </script>
+</body>
+</html>
